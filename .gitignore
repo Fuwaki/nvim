@@ -12,3 +12,6 @@ spell/
 nvim-pack-lock.json
 
 .DS_Store
+
+# 本机专属覆盖（见 init.lua SECTION 0）；每台机器各写各的，别提交
+lua/custom/local.lua

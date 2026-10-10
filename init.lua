@@ -85,6 +85,54 @@ P.S. You can delete this when you're done too. It's your config now! :)
 --]]
 
 -- ============================================================
+-- SECTION 0: MACHINE-LOCAL OVERRIDES
+-- 同一份 init.lua 到处用，机器之间只差「某些插件不想装/装不了」时，改这里就够。
+-- ============================================================
+do
+  -- 禁用名单，两个来源合并生效：
+  --
+  --  1) 本机文件 <config>/lua/custom/local.lua（已 gitignore，不随配置走）。内容形如：
+  --       return { disabled_plugins = { 'neocursor' } }
+  --     换机器只加这一个文件，init.lua 一个字都不用动。
+  --
+  --  2) 环境变量（临时试探 / 别人的机器上看一眼最省事）：
+  --       NVIM_DISABLED_PLUGINS=neocursor nvim
+  --
+  -- name 是下面 gating 时用的 key（自己起），不是 git 仓库名。
+  local disabled = {}
+
+  for name in (vim.env.NVIM_DISABLED_PLUGINS or ''):gmatch '[^,%s]+' do
+    disabled[name] = true
+  end
+
+  -- 用 init.lua 自身的位置定位配置根目录：这样普通 `nvim`、`nvim /path/to/init.lua`
+  -- 和带 NVIM_APPNAME 的启动方式都读到同一个文件（后者的 stdpath('config') 指向别处，
+  -- 所以不能用 require 靠 runtimepath 找）。
+  local local_file = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h') .. '/lua/custom/local.lua'
+  if vim.uv.fs_stat(local_file) then
+    local ok, cfg = pcall(dofile, local_file)
+    if not ok then
+      -- 静默失败最坑人：local.lua 写错了还以为生效了
+      vim.notify('lua/custom/local.lua 加载失败，已忽略: ' .. tostring(cfg), vim.log.levels.ERROR)
+    elseif type(cfg) ~= 'table' then
+      vim.notify('lua/custom/local.lua 必须 `return { ... }` 一个 table，已忽略', vim.log.levels.ERROR)
+    else
+      for _, name in ipairs(cfg.disabled_plugins or {}) do
+        disabled[name] = true
+      end
+    end
+  end
+
+  -- 调试：`:lua =vim.g.disabled_plugins` 看本机到底关了哪些
+  vim.g.disabled_plugins = vim.tbl_keys(disabled)
+
+  --- 插件是否启用。用法：`if plugin_enabled 'neocursor' then ... end`
+  ---@param name string
+  ---@return boolean
+  function plugin_enabled(name) return not disabled[name] end
+end
+
+-- ============================================================
 -- SECTION 1: OPTIONS
 -- Core Neovim settings, leaders, options
 -- ============================================================
@@ -110,7 +158,7 @@ do
   vim.o.number = true
   -- You can also add relative line numbers, to help with jumping.
   --  Experiment for yourself to see if you like it!
-  -- vim.o.relativenumber = true
+  vim.o.relativenumber = true
 
   -- Enable mouse mode, can be useful for resizing splits for example!
   vim.o.mouse = 'a'
@@ -251,6 +299,44 @@ do
     group = vim.api.nvim_create_augroup('kickstart-highlight-yank', { clear = true }),
     callback = function() vim.hl.on_yank() end,
   })
+
+  -- [[ 外部改动同步 ]]
+  -- 文件在 nvim 外被改了（git checkout / 别的编辑器 / 代码生成）时，把磁盘版本读进缓冲区。
+  -- 'autoread' 默认是开的，但 nvim 不会主动"检测"，必须自己在这些时机调 checktime。
+  -- NOTE: 必须用 vim.schedule 推迟到主循环执行 —— 在 autocmd 回调里直接调 checktime
+  --       不会真的去重载/触发 FileChangedShell（实测 0.12 如此），nested 也没用。
+  -- 检测到变化时：缓冲区没有本地改动 → 静默重载；缓冲区也有改动（真冲突）→ 不重载，交给下面的处理
+  vim.api.nvim_create_autocmd({ 'FocusGained', 'BufEnter', 'TermClose', 'TermLeave', 'CursorHold' }, {
+    desc = 'File changed on disk? Check, and reload it when the buffer has no local changes',
+    group = vim.api.nvim_create_augroup('kickstart-checktime', { clear = true }),
+    callback = function()
+      vim.schedule(function() vim.cmd.checktime() end)
+    end,
+  })
+
+  -- 两边都改了（v:fcs_reason == 'conflict'）时：给缓冲区打标记，让自动保存跳过它，并明确告警。
+  -- 注意：有 FileChangedShell autocmd 时 nvim 自己的警告不再弹出，所以这里必须自己通知用户
+  vim.api.nvim_create_autocmd('FileChangedShell', {
+    desc = 'Mark conflicting external changes (auto-save will skip this buffer)',
+    group = vim.api.nvim_create_augroup('kickstart-file-changed', { clear = true }),
+    callback = function(args)
+      if vim.v.fcs_reason ~= 'conflict' then return end
+      vim.b[args.buf].external_conflict = true
+      vim.notify(
+        ('%s 在磁盘上被外部改过，缓冲区里也有未保存的改动：已暂停自动保存。用 :e! 读磁盘版本，或用 :w! 覆盖磁盘。'):format(
+          vim.fn.fnamemodify(args.file, ':t')
+        ),
+        vim.log.levels.WARN
+      )
+    end,
+  })
+
+  -- 冲突解决后清掉标记：:e! 走 BufReadPost，:w! 走 BufWritePost
+  vim.api.nvim_create_autocmd({ 'BufWritePost', 'BufReadPost' }, {
+    desc = 'Clear the external-conflict flag',
+    group = vim.api.nvim_create_augroup('kickstart-file-changed-clear', { clear = true }),
+    callback = function(args) vim.b[args.buf].external_conflict = nil end,
+  })
 end
 
 -- ============================================================
@@ -307,6 +393,11 @@ do
 
       if name == 'LuaSnip' then
         if vim.fn.has 'win32' ~= 1 and vim.fn.executable 'make' == 1 then run_build(name, { 'make', 'install_jsregexp' }, ev.data.path) end
+        return
+      end
+
+      if name == 'neocursor.nvim' and vim.fn.executable 'uv' == 1 then
+        run_build(name, { 'uv', 'run', '--with', 'httpx[http2]', 'python', '-c', 'import httpx' }, ev.data.path)
         return
       end
 
@@ -401,6 +492,33 @@ do
       vim.keymap.set({ 'o', 'x' }, 'ih', gitsigns.select_hunk, { desc = 'text object [i]nside [h]unk', buf = bufnr })
     end,
   }
+  -- [[ 自动保存 ]]
+  -- 离开插入模式 / 切 buffer / 窗口失焦 / 退出前 自动写盘；去抖 1s，回到插入模式会取消待保存
+  -- 只在 buffer 真被改过时才写；nomodifiable 的 buffer 自动跳过
+  -- 见 https://github.com/okuuva/auto-save.nvim
+  vim.pack.add { { src = gh 'okuuva/auto-save.nvim', version = vim.version.range '1.*' } }
+  require('auto-save').setup {
+    debounce_delay = 1000, -- 毫秒；设 0 = 关掉去抖（立即存）
+    condition = function(buf) -- 返回 false 的 buffer 不自动保存
+      if vim.fn.getbufvar(buf, '&buftype') ~= '' then return false end -- terminal/prompt/nofile 等特殊 buffer
+      if vim.fn.getbufvar(buf, '&filetype') == 'gitcommit' then return false end -- 写 commit message 时别自动存
+      if vim.b[buf].external_conflict then return false end -- 文件被外部改过而缓冲区也有改动：交给用户决定（见 SECTION 2）
+      return true
+    end,
+  }
+
+  -- 临时开关（which-key 里 <leader>t 就是 Toggle 组）
+  vim.keymap.set('n', '<leader>ta', '<cmd>ASToggle<CR>', { desc = '[T]oggle [A]uto-save' })
+
+  -- 每次自动保存给个通知
+  local autosave_grp = vim.api.nvim_create_augroup('kickstart-autosave-notify', { clear = true })
+  vim.api.nvim_create_autocmd('User', {
+    pattern = 'AutoSaveWritePost',
+    group = autosave_grp,
+    callback = function(ev)
+      if ev.data.saved_buffer then vim.notify('autosave -> ' .. vim.fn.fnamemodify(vim.api.nvim_buf_get_name(ev.data.saved_buffer), ':t')) end
+    end,
+  })
 
   -- Useful plugin to show you pending keybinds.
   vim.pack.add { gh 'folke/which-key.nvim' }
@@ -434,7 +552,7 @@ do
   -- Load the colorscheme here.
   -- Like many other themes, this one has different styles, and you could load
   -- any other, such as 'tokyonight-storm', 'tokyonight-moon', or 'tokyonight-day'.
-  vim.cmd.colorscheme 'tokyonight-night'
+  vim.cmd.colorscheme 'tokyonight'
 
   -- Highlight todo, notes, etc in comments
   vim.pack.add { gh 'folke/todo-comments.nvim' }
@@ -472,7 +590,7 @@ do
   -- - sd'   - [S]urround [D]elete [']quotes
   -- - sr)'  - [S]urround [R]eplace [)] [']
   require('mini.surround').setup()
-
+  require('mini.move').setup()
   -- Simple and easy statusline.
   --  You could remove this setup call if you don't like it,
   --  and try some other statusline plugin
@@ -932,6 +1050,16 @@ do
     -- Shows a signature help window while you type arguments for a function
     signature = { enabled = true },
   }
+  -- [[ neocursor ]]：Cursor Tab 的移植，需要一个 Python sidecar（uv + httpx），
+  -- 并且 `setup()` 会接管 <Tab>。装不了 / 不想用的机器，把它加进 SECTION 0 的禁用名单即可：
+  -- 不进 runtimepath、不加载、不建侧车进程，<Tab> 回到 Neovim 原生行为。
+  --
+  -- 盘上那份：lockfile 没提交，所以新机器上它压根不会被下载。已经装过的机器若想连
+  -- 目录一起清掉：`:lua vim.pack.del({ 'neocursor.nvim' })`（只影响这台机器）。
+  if plugin_enabled 'neocursor' then
+    vim.pack.add { { src = gh 'teocns/neocursor.nvim', version = vim.version.range '*' } }
+    require('neocursor').setup {}
+  end
 end
 
 -- ============================================================
